@@ -36,6 +36,8 @@ param(
   [string[]]$PastasExtras = @()
 )
 $ErrorActionPreference = 'Continue'
+$ArquivoDoRelatorio = $Saida
+if (-not $ArquivoDoRelatorio) { $ArquivoDoRelatorio = Join-Path ([Environment]::GetFolderPath('Desktop')) 'HiDoctor-estrutura.txt' }
 $Linhas = New-Object System.Collections.Generic.List[string]
 function W([string]$s) { $Linhas.Add($s); Write-Host $s }
 # A relative path cut to the first folder and the file name: deeper folders (an attachment folder
@@ -327,8 +329,8 @@ if ($sqlite.Count -gt 0) {
     if (-not $uv) { W '  (sem o uv para ler a estrutura)'; continue }
     # Single quotes only: Windows PowerShell 5.1 does not escape double quotes for native programs.
     $py = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); [print(r[0]) for r in c.execute('select sql from sqlite_master where sql is not null')]"
-    $saida = Executar $uv @('run', '--no-project', 'python', '-c', $py, $a.Arquivo.FullName)
-    foreach ($l in ($saida -split "`r?`n")) { W ('  ' + $l) }
+    $esquema = Executar $uv @('run', '--no-project', 'python', '-c', $py, $a.Arquivo.FullName)
+    foreach ($l in ($esquema -split "`r?`n")) { W ('  ' + $l) }
   }
 }
 
@@ -355,8 +357,117 @@ foreach ($c in ($ArquivosConfig | Select-Object -First 40)) {
 }
 
 # ---------------------------------------------------------------------------------------------
-$destino = $Saida
-if (-not $destino) { $destino = Join-Path ([Environment]::GetFolderPath('Desktop')) 'HiDoctor-estrutura.txt' }
+Secao '9. PostgreSQL (estrutura das tabelas, sem dados)'
+# HiDoctor 10 keeps its data in PostgreSQL. The structure comes from PostgreSQL's own tools, which
+# are told to leave the data out: pg_restore --schema-only on a backup file (no connection, no
+# password) and, when the server lets this computer in without a password, pg_dump --schema-only
+# and the approximate row counts of the statistics. No data row is ever requested, and any COPY or
+# INSERT line is dropped anyway.
+function Filtrar-Estrutura([string]$texto) {
+  $dentro = $false; $tabela = ''
+  foreach ($l in ($texto -split "`r?`n")) {
+    if ($l -match '^\s*(COPY|INSERT)\s' -or $l -eq '\.') { $dentro = $false; continue }
+    if ($l -match '^CREATE (UNLOGGED )?TABLE ') { $dentro = $true }
+    if ($dentro) { W ('  ' + $l); if ($l -match '\);\s*$') { $dentro = $false; W '' }; continue }
+    if ($l -match '^ALTER TABLE (ONLY )?(\S+)') { $tabela = $Matches[2]; continue }
+    if ($l -match '^\s+ADD CONSTRAINT (.*)$' -and $tabela) { W ('  ' + $tabela + ': ' + $Matches[1]); continue }
+    if ($l -match '^COMMENT ON (TABLE|COLUMN) ') { W ('  ' + $l) }
+  }
+}
+$PgBins = New-Object System.Collections.Generic.List[string]
+$PgServicos = @()
+try {
+  Get-WmiObject Win32_Service -ErrorAction Stop | Where-Object { $_.PathName -match 'pg_ctl' } | ForEach-Object {
+    $bin = ''; $dados = ''
+    if ($_.PathName -match '^"?([^"]*\\bin)\\pg_ctl') { $bin = $Matches[1]; $PgBins.Add($bin) }
+    if ($_.PathName -match '-D\s+"([^"]+)"') { $dados = $Matches[1] } elseif ($_.PathName -match '-D\s+(\S+)') { $dados = $Matches[1] }
+    $PgServicos += @{ Nome = $_.Name; Estado = $_.State; Bin = $bin; Dados = ($dados -replace '/', '\') }
+  }
+} catch { }
+foreach ($r in $Raizes) { Get-ChildItem -LiteralPath $r -Recurse -Filter 'pg_restore.exe' -ErrorAction SilentlyContinue | ForEach-Object { $PgBins.Add($_.DirectoryName) } }
+$PgBins = @($PgBins | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'pg_restore.exe')) } | Sort-Object -Unique)
+if ($PgServicos.Count -eq 0 -and $PgBins.Count -eq 0) { W '  Nenhum PostgreSQL encontrado.' }
+$env:PGCONNECT_TIMEOUT = '5'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
+foreach ($sv in $PgServicos) {
+  W ('  Serviço ' + $sv.Nome + ' (' + $sv.Estado + '); programas em ' + $sv.Bin + '; dados em ' + $sv.Dados)
+  $porta = '5432'
+  $usuarios = New-Object System.Collections.Generic.List[string]
+  $usuarios.Add('postgres')
+  try {
+    foreach ($l in (Get-Content -LiteralPath (Join-Path $sv.Dados 'postgresql.conf') -ErrorAction Stop)) { if ($l -match '^\s*port\s*=\s*(\d+)') { $porta = $Matches[1] } }
+    W ('  porta ' + $porta)
+  } catch { W ('  (postgresql.conf não pôde ser lido: ' + $_.Exception.Message + '; supondo a porta 5432)') }
+  try {
+    W '  pg_hba.conf (quem pode entrar e como):'
+    foreach ($l in (Get-Content -LiteralPath (Join-Path $sv.Dados 'pg_hba.conf') -ErrorAction Stop)) {
+      if ($l -match '^\s*(#|$)') { continue }
+      W ('      ' + ($l -replace '\s+', ' '))
+      $c = ($l.Trim() -split '\s+'); if ($c.Count -ge 3 -and $c[2] -notin 'all', 'replication') { foreach ($u in $c[2].Split(',')) { $usuarios.Add($u) } }
+    }
+  } catch { W ('  (pg_hba.conf não pôde ser lido: ' + $_.Exception.Message + ')') }
+  $psql = Join-Path $sv.Bin 'psql.exe'; $dump = Join-Path $sv.Bin 'pg_dump.exe'
+  if (-not (Test-Path -LiteralPath $psql)) { continue }
+  $entrou = $false
+  foreach ($u in ($usuarios | Sort-Object -Unique)) {
+    # -w: never asks for a password; without one that is accepted, this simply fails.
+    $bancos = Executar $psql @('-h', '127.0.0.1', '-p', $porta, '-U', $u, '-w', '-d', 'postgres', '-At', '-c', 'select datname from pg_database where not datistemplate')
+    if ($bancos -match 'FATAL|ERRO|ERROR|could not|não foi possível|password|senha') { continue }
+    $entrou = $true
+    W ('  Conectado sem senha como ' + $u + '.')
+    foreach ($db in ($bancos -split "`r?`n" | Where-Object { $_ -and $_ -ne 'postgres' })) {
+      W ''; W ('  BANCO ' + $db + ' (linhas aproximadas, pelas estatísticas do PostgreSQL):')
+      $contagens = Executar $psql @('-h', '127.0.0.1', '-p', $porta, '-U', $u, '-w', '-d', $db, '-At', '-F', ' | ', '-c', 'select schemaname || ''.'' || relname, n_live_tup from pg_stat_user_tables order by 1')
+      foreach ($l in ($contagens -split "`r?`n" | Where-Object { $_ })) { W ('    ' + $l) }
+      if (Test-Path -LiteralPath $dump) {
+        W ''; W '  Estrutura (pg_dump --schema-only, nenhum dado):'
+        Filtrar-Estrutura (Executar $dump @('-h', '127.0.0.1', '-p', $porta, '-U', $u, '-w', '--schema-only', '--no-owner', '--no-privileges', $db))
+      }
+    }
+    break
+  }
+  if (-not $entrou) { W '  O servidor pede senha: a estrutura vem da cópia de segurança, abaixo.' }
+}
+
+# Backup files (MedSync): their names are not shown, only how many, the newest one's date and size,
+# and its format; a PostgreSQL backup's structure is read with pg_restore --schema-only.
+$copias = @()
+foreach ($r in $Raizes) { $copias += @(Get-ChildItem -LiteralPath $r -Recurse -File -Filter '*.backup' -ErrorAction SilentlyContinue) }
+$copias = @($copias | Sort-Object LastWriteTime -Descending)
+if ($copias.Count -gt 0) {
+  $nova = $copias[0]
+  W ''; W ('  Cópias .backup: ' + $copias.Count + '; a mais recente é de ' + $nova.LastWriteTime.ToString('yyyy-MM-dd HH:mm') + ', ' + [math]::Round($nova.Length / 1MB, 1) + ' MB')
+  $cab = New-Object byte[] 8
+  try { $fs = [IO.File]::Open($nova.FullName, 'Open', 'Read', 'ReadWrite'); [void]$fs.Read($cab, 0, 8); $fs.Close() } catch { }
+  $magica = [Text.Encoding]::ASCII.GetString($cab, 0, 5)
+  if ($magica -eq 'PGDMP') {
+    W '  Formato: cópia do PostgreSQL (pg_dump, formato personalizado).'
+    $lido = $false
+    foreach ($bin in $PgBins) {
+      $temporario = Join-Path $env:TEMP ('Inspecionar-HiDoctor-esquema-' + [guid]::NewGuid().ToString('N') + '.sql')
+      $mensagens = Executar (Join-Path $bin 'pg_restore.exe') @('--schema-only', '--no-owner', '--no-privileges', '-f', $temporario, $nova.FullName)
+      $estrutura = ''
+      if (Test-Path -LiteralPath $temporario) { $estrutura = [IO.File]::ReadAllText($temporario, [Text.Encoding]::UTF8); Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue }
+      if ($estrutura -match 'CREATE TABLE') { W ('  Estrutura (pg_restore --schema-only, nenhum dado), com ' + $bin + ':'); Filtrar-Estrutura $estrutura; $lido = $true; break }
+      W ('  pg_restore em ' + $bin + ' não leu a cópia: ' + (($mensagens -split "`r?`n" | Select-Object -First 2) -join ' '))
+    }
+    if (-not $lido) { W '  Não consegui ler a estrutura da cópia.' }
+  } elseif ($cab[0] -eq 0x50 -and $cab[1] -eq 0x4B) {
+    W '  Formato: arquivo .zip. Conteúdo por extensão (sem nomes):'
+    try {
+      Add-Type -AssemblyName System.IO.Compression.FileSystem
+      $zip = [IO.Compression.ZipFile]::OpenRead($nova.FullName)
+      $zip.Entries | Group-Object { [IO.Path]::GetExtension($_.FullName).ToLower() } | Sort-Object Count -Descending | ForEach-Object { W ('      ' + $(if ($_.Name) { $_.Name } else { '(sem extensão)' }) + ' x' + $_.Count + ', ' + [math]::Round((($_.Group | Measure-Object Length -Sum).Sum) / 1MB, 1) + ' MB') }
+      $zip.Dispose()
+    } catch { W ('      (não consegui abrir: ' + $_.Exception.Message + ')') }
+  } else {
+    W ('  Formato desconhecido (início ' + (($cab[0..7] | ForEach-Object { $_.ToString('X2') }) -join ' ') + ').')
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+$destino = $ArquivoDoRelatorio
 [IO.File]::WriteAllLines($destino, $Linhas, (New-Object Text.UTF8Encoding $true))
 Write-Host ''
 Write-Host ('Pronto. O relatório está em: ' + $destino)
