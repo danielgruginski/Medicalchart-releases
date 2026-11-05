@@ -1,0 +1,2 @@
+# Windows batch files are stored byte for byte (CRLF), so a raw download runs as is.
+*.cmd -text

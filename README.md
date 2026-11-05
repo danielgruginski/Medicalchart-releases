@@ -10,3 +10,11 @@ paciente passa por aqui, e o código-fonte fica em um repositório privado.
   instalar.
 
 As versões são publicadas automaticamente pelo processo de publicação do repositório principal.
+
+## Ferramentas
+
+- [`ferramentas/Inspecionar-HiDoctor.cmd`](ferramentas/Inspecionar-HiDoctor.cmd): gera, no próprio
+  computador, um relatório só com a **estrutura** do banco do HiDoctor (programas, nomes de tabelas e
+  colunas, contagens), para preparar a importação. Não lê nenhum registro de paciente e não envia
+  nada. Para baixar: abra o link e clique no botão **Download raw file** (seta para baixo).
+
